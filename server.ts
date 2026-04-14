@@ -458,7 +458,7 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
 
   // Standalone emoji shortcut: 👍/✅ = allow, 👎/❌ = deny, resolves the most
   // recent pending permission. Faster than long-pressing for a reaction in Element.
-  const trimmed = body.trim()
+  const trimmed = body.trim().replace(/[\uFE0E\uFE0F]/g, '')
   const emojiAllow = ['👍', '✅']
   const emojiDeny = ['👎', '❌']
   if (pendingPermissions.size > 0 && (emojiAllow.includes(trimmed) || emojiDeny.includes(trimmed))) {
@@ -533,9 +533,11 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
   if (!request_id) return
   if (!pendingPermissions.has(request_id)) return
 
+  // Strip Unicode variation selectors (U+FE0E/FE0F) — Element appends them
+  const normalizedKey = key.replace(/[\uFE0E\uFE0F]/g, '')
   let behavior: 'allow' | 'deny' | null = null
-  if (key === '👍' || key === '✅') behavior = 'allow'
-  else if (key === '👎' || key === '❌') behavior = 'deny'
+  if (normalizedKey === '👍' || normalizedKey === '✅') behavior = 'allow'
+  else if (normalizedKey === '👎' || normalizedKey === '❌') behavior = 'deny'
   if (!behavior) return
 
   void mcp.notification({
@@ -550,15 +552,8 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 
 // room.event fires for all timeline events including m.reaction (which is not
 // surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
-import { appendFileSync } from 'fs'
-const EVENT_DEBUG_LOG = join(STATE_DIR, 'event-debug.log')
-
 client.on('room.event', (roomId: string, event: unknown) => {
-  const e = event as ReactionEvent
-  try {
-    appendFileSync(EVENT_DEBUG_LOG, `${new Date().toISOString()} room.event type=${e.type} from=${e.sender} relates_to=${JSON.stringify(e.content?.['m.relates_to'] ?? null)}\n`)
-  } catch {}
-  void handleReaction(roomId, e)
+  void handleReaction(roomId, event as ReactionEvent)
 })
 
 client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
