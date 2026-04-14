@@ -700,27 +700,25 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
   const key = relates.key
   if (!targetEventId || !key) return
 
-  const request_id = permissionEventIds.get(targetEventId)
-  if (!request_id) return
-  if (!pendingPermissions.has(request_id)) return
-
   // Strip Unicode variation selectors (U+FE0E/FE0F) — Element appends them
   const normalizedKey = key.replace(/[\uFE0E\uFE0F]/g, '')
 
-  // Permission approval via reaction
-  let behavior: 'allow' | 'deny' | null = null
-  if (normalizedKey === '👍' || normalizedKey === '✅') behavior = 'allow'
-  else if (normalizedKey === '👎' || normalizedKey === '❌') behavior = 'deny'
-  if (behavior) {
-    void mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: { request_id, behavior },
-    })
-    pendingPermissions.delete(request_id)
-    permissionEventIds.delete(targetEventId)
-    // React on the original permission message to confirm receipt
-    void sendReaction(ROOM_ID!, targetEventId, behavior === 'allow' ? '✅' : '❌')
-    return
+  // Permission approval via reaction (only if this is a known permission message)
+  const request_id = permissionEventIds.get(targetEventId)
+  if (request_id && pendingPermissions.has(request_id)) {
+    let behavior: 'allow' | 'deny' | null = null
+    if (normalizedKey === '👍' || normalizedKey === '✅') behavior = 'allow'
+    else if (normalizedKey === '👎' || normalizedKey === '❌') behavior = 'deny'
+    if (behavior) {
+      void mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: { request_id, behavior },
+      })
+      pendingPermissions.delete(request_id)
+      permissionEventIds.delete(targetEventId)
+      void sendReaction(ROOM_ID!, targetEventId, behavior === 'allow' ? '✅' : '❌')
+      return
+    }
   }
 
   // Number emoji reactions on bot messages → forward to Claude as a selection.
