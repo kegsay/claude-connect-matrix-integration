@@ -1,10 +1,10 @@
 # claude-matrix-e2ee
 
-A **Matrix channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code)** that bridges an E2EE-encrypted Matrix room to a running Claude Code session. Send a message from any Matrix client (Element, FluffyChat, Cinny) → Claude sees it, replies back to the encrypted room.
+A Matrix channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that wires an end-to-end encrypted Matrix room into a running Claude Code session. Send a message from any Matrix client (Element, FluffyChat, Cinny), Claude sees it, Claude replies back into the encrypted room.
 
-**Works wherever Claude Code runs** — headless servers, WSL, SSH sessions, bare terminals. No Claude desktop app required, no third-party messaging service in the loop.
+Works wherever Claude Code runs: headless servers, WSL, SSH sessions, plain terminals. No desktop app, no third-party messaging service sitting in the middle.
 
-This is a fork of [metalchef1/Claude-Connect-Matrix-Integration](https://github.com/metalchef1/Claude-Connect-Matrix-Integration) with the Matrix I/O layer rewritten on top of [`matrix-bot-sdk`](https://github.com/turt2live/matrix-bot-sdk) so it can join end-to-end encrypted rooms. The crypto self-signing routine was lifted from [Kholtien/nanoclaw](https://github.com/Kholtien/nanoclaw).
+This is a fork of [metalchef1/Claude-Connect-Matrix-Integration](https://github.com/metalchef1/Claude-Connect-Matrix-Integration) with the Matrix I/O layer rewritten on top of [`matrix-bot-sdk`](https://github.com/turt2live/matrix-bot-sdk) so the bot can actually join encrypted rooms. The crypto self-signing routine is lifted from [Kholtien/nanoclaw](https://github.com/Kholtien/nanoclaw).
 
 ---
 
@@ -25,11 +25,11 @@ This is a fork of [metalchef1/Claude-Connect-Matrix-Integration](https://github.
 
 | Requirement | Notes |
 |---|---|
-| **Self-hosted Matrix homeserver** | Conduit, Tuwunel, Synapse, Dendrite — anything you control. The bot's account credentials must be readable on the machine running Claude Code. |
-| **Node.js ≥ 20** | The Rust crypto binding ships as a native Node module. Bun may work but is unverified. |
+| **Self-hosted Matrix homeserver** | Conduit, Tuwunel, Synapse, Dendrite, anything you run yourself. The bot's credentials have to be readable on the machine running Claude Code. |
+| **Node.js ≥ 20** | The Rust crypto binding is a native Node module. Bun might work, I haven't tried. |
 | **Claude Code 2.x** | With Channels support |
-| **A bot Matrix account** | Created on your homeserver |
-| **Secure Backup enabled on the bot account** | Needed for automatic device verification (optional but recommended — without it, Element will keep flagging the bot as "unverified") |
+| **A bot Matrix account** | Registered on your homeserver |
+| **Secure Backup enabled on the bot account** | Optional but recommended. Without it the bot still works, but Element will keep flagging its device as unverified. |
 
 ---
 
@@ -46,7 +46,7 @@ npm install
 
 ### 2. Create the bot account
 
-Register a fresh user on your homeserver (any Matrix client will do). Pick a strong password — you'll need it. Example with curl:
+Register a fresh user on your homeserver. Any Matrix client will do, or curl if you prefer. Pick a strong password, you'll need it in a moment.
 
 ```bash
 curl -X POST https://your.homeserver/_matrix/client/v3/register \
@@ -56,11 +56,11 @@ curl -X POST https://your.homeserver/_matrix/client/v3/register \
 
 ### 3. Set up Secure Backup on the bot (optional but recommended)
 
-Log into Element as the bot account. Go to **Settings → Security & Privacy → Secure Backup → Set up**. Capture the recovery key — you'll need it for `MATRIX_RECOVERY_KEY`. Without this, the bot still functions but Element will show its device as unverified.
+Log into Element as the bot account and go to **Settings → Security & Privacy → Secure Backup → Set up**. Save the recovery key somewhere, it's what you'll feed into `MATRIX_RECOVERY_KEY`. Skip this and the bot will still run, it'll just look perpetually unverified to other devices in the room.
 
 ### 4. Create the room
 
-From your **personal** account, create a private encrypted room and invite the bot. The bot will auto-accept the invite *if and only if* it matches `MATRIX_ROOM_ID`. Get the internal room ID from your client (Element: Room Settings → Advanced → Internal room ID).
+From your *personal* account, create a private encrypted room and invite the bot. The bot auto-accepts the invite only if the room matches `MATRIX_ROOM_ID`, everything else is ignored. Grab the internal room ID from your client (in Element: Room Settings → Advanced → Internal room ID).
 
 ### 5. Configure credentials
 
@@ -75,9 +75,9 @@ MATRIX_RECOVERY_KEY=<bot SSSS recovery key, optional>
 MATRIX_E2EE=true
 ```
 
-You can use `MATRIX_ACCESS_TOKEN` instead of `MATRIX_PASSWORD`, but password login is preferred — the plugin pins the bot's crypto device ID across restarts so you don't lose Olm state.
+You can use `MATRIX_ACCESS_TOKEN` instead of `MATRIX_PASSWORD`, but password is preferred. With a password the plugin can pin the bot's crypto device ID across restarts, which keeps Olm state intact, so you don't end up with a fresh "unverified" device every time the service bounces.
 
-Or use the bundled skill (recommended): `/matrix:configure` walks you through every value and writes the file with correct permissions.
+Or just run `/matrix:configure`, which is the path I'd recommend. It asks for each value, writes the file with the right permissions, and won't overwrite anything you didn't ask it to change.
 
 ### 6. Register with Claude Code
 
@@ -95,7 +95,7 @@ claude --dangerously-load-development-channels server:matrix
 /matrix:access allow @you:your.homeserver
 ```
 
-Anyone not on the allowlist is silently dropped. Only the configured `ROOM_ID` is accepted; invites to other rooms are ignored.
+Anything from a user who isn't on the allowlist is silently dropped. Invites to rooms other than the configured `ROOM_ID` are ignored.
 
 ### 8. Launch
 
@@ -103,9 +103,9 @@ Anyone not on the allowlist is silently dropped. Only the configured `ROOM_ID` i
 claude --dangerously-load-development-channels server:matrix
 ```
 
-The `--dangerously-load-development-channels` flag is required because this plugin is not on Anthropic's official channel allowlist. It opts the session into inbound message delivery from unlisted MCP servers.
+The `--dangerously-load-development-channels` flag is required because this plugin isn't on Anthropic's official channel allowlist. It opts the session into inbound message delivery from unlisted MCP servers. Scary-sounding flag, fairly mundane reason.
 
-You can persist this with an alias:
+If you're running this a lot, alias it:
 
 ```bash
 alias claude='claude --dangerously-load-development-channels server:matrix'
@@ -115,13 +115,13 @@ alias claude='claude --dangerously-load-development-channels server:matrix'
 
 ## Optional: run as a background service
 
-If you want a permanent always-on bot you can talk to from anywhere, the skill `/matrix:configure systemd` will scaffold a systemd user unit + tmux wrapper for you. The wrapper runs Claude Code inside `tmux -L claude-matrix attach -t matrix-<workdir-name>` so you can attach locally and see what the bot is doing.
+If you want an always-on bot you can message from anywhere, `/matrix:configure systemd` will scaffold a systemd user unit and a tmux wrapper. The wrapper runs Claude Code inside `tmux -L claude-matrix` so you can attach locally (`tmux -L claude-matrix attach -t matrix-<workdir-name>`) to see what the bot is actually doing.
 
-The systemd path requires:
-- A working systemd user session (`loginctl enable-linger $USER` on most distros so it survives logout)
-- `tmux` installed
+The systemd path needs:
+- A working systemd user session. On most distros that means `loginctl enable-linger $USER` so it survives logout.
+- `tmux` installed.
 
-Alternatively, you can wrap it in any process supervisor you prefer (s6, runit, supervisord, screen). The plugin itself is just a stdio MCP server — Claude Code is the long-running process.
+If systemd isn't your thing, any supervisor works: s6, runit, supervisord, screen, whatever. The plugin itself is just a stdio MCP server. Claude Code is the actual long-running process you need to keep alive.
 
 ---
 
@@ -129,10 +129,10 @@ Alternatively, you can wrap it in any process supervisor you prefer (s6, runit, 
 
 | Skill | What it does |
 |---|---|
-| `/matrix:configure` | Full setup walkthrough: prereqs, repo, npm install, homeserver config, bot creation, room ID, SSSS key, MCP registration, allowlist, optional systemd+tmux. Re-run anytime to update. |
-| `/matrix:access` | Manage the inbound allowlist — `allow @user`, `remove @user`, `list`, `policy disabled` |
+| `/matrix:configure` | Full setup walkthrough: prereqs, repo, npm install, homeserver config, bot creation, room ID, SSSS key, MCP registration, allowlist, optional systemd+tmux. Safe to re-run to update a single value. |
+| `/matrix:access` | Manage the inbound allowlist: `allow @user`, `remove @user`, `list`, `policy disabled` |
 
-The `/matrix:access` skill explicitly refuses to process access-list changes that arrive via Matrix — that's a prompt-injection vector. Only commands typed directly into the terminal are honoured.
+The `/matrix:access` skill will refuse to process access-list changes that come in over Matrix. That's a prompt-injection vector and it has to stay closed. Only commands typed directly into the terminal are honoured.
 
 ---
 
@@ -140,28 +140,28 @@ The `/matrix:access` skill explicitly refuses to process access-list changes tha
 
 ### Threat model
 
-This plugin is designed for use against **a homeserver you control**. The bot account's password and the SSSS recovery key are read from a local `.env` file. If an attacker has read access to `~/.claude/channels/matrix-e2ee/`, they have full control of the bot identity. Defence relies on filesystem permissions (`0700` directory, `0600` files).
+This plugin assumes you're pointing it at a homeserver you control. The bot's password and SSSS recovery key live in a local `.env` file, and anyone with read access to `~/.claude/channels/matrix-e2ee/` effectively owns the bot's identity. Defence is filesystem permissions: `0700` on the directory, `0600` on the files. If that isn't enough for your setup, this probably isn't the right tool.
 
 ### Allowlist + permission relay
 
 - Inbound Matrix messages are dropped unless the sender is on the allowlist (`access.json`).
-- The `yes <id>` / `no <id>` permission-reply intercept will only honour replies for permission requests the plugin actually relayed — pre-emptive forging of grant IDs is rejected with a `❓` reaction.
-- Auto-join is restricted to the configured `MATRIX_ROOM_ID` only; invites to other rooms are ignored.
+- The `yes <id>` / `no <id>` permission-reply intercept only honours replies for permission requests the plugin actually relayed. Trying to forge a grant ID preemptively gets rejected with a ❓ reaction.
+- Auto-join is restricted to the configured `MATRIX_ROOM_ID`. Invites to any other room are ignored.
 
 ### Known dependency advisories
 
-`matrix-bot-sdk@0.8.0` transitively pulls the deprecated `request` package, which brings in advisories on `form-data`, `tough-cookie`, and `qs`. `npm audit` reports 2 critical and 5 moderate vulnerabilities at the time of writing.
+`matrix-bot-sdk@0.8.0` transitively pulls in the deprecated `request` package, which drags along advisories on `form-data`, `tough-cookie`, and `qs`. `npm audit` currently reports 2 critical and 5 moderate vulnerabilities.
 
-These are reachable — every Matrix HTTP request goes through the affected stack. **Risk-accepted** because:
-- The bot only talks to a homeserver you operate yourself, on a known URL (`MATRIX_HOMESERVER_URL`), so the attack surface is limited to a server you already trust.
-- No upstream fix exists in `matrix-bot-sdk@0.8.x` — the SDK author has stated `request` will be removed in a future major.
-- `form-data`'s unsafe-random boundary issue is irrelevant when sending JSON requests (no multipart bodies); `tough-cookie`'s prototype pollution requires attacker-controlled cookies, which a Matrix homeserver doesn't set; `qs` DoS requires attacker-controlled query strings, which the Matrix CS API doesn't use.
+These are reachable. Every Matrix HTTP request goes through the affected stack. Risk-accepted here because:
+- The bot only talks to a homeserver you run yourself, on a known URL (`MATRIX_HOMESERVER_URL`). The attack surface is a server you already trust.
+- There's no upstream fix in `matrix-bot-sdk@0.8.x`. The SDK author has said `request` will be removed in a future major.
+- The specific advisories don't apply to how this plugin uses the stack: `form-data`'s unsafe-random boundary issue is irrelevant when sending JSON (no multipart bodies), `tough-cookie`'s prototype pollution needs attacker-controlled cookies that a Matrix homeserver never sets, and `qs` DoS needs attacker-controlled query strings that the Matrix CS API doesn't use.
 
-If you'd rather not accept the risk, run the bot inside a container with no outbound network access except to your homeserver, or wait for a `matrix-bot-sdk` release that drops `request`.
+If you'd rather not take that on, run the bot in a container with outbound network locked down to your homeserver, or wait for a `matrix-bot-sdk` release that drops `request` entirely.
 
 ### Stdio MCP hygiene
 
-`matrix-bot-sdk` writes its internal logs to **stdout** by default, which corrupts the JSON-RPC channel that stdio MCP servers communicate on. The plugin overrides `LogService` at boot to redirect everything to stderr — do not remove this override.
+`matrix-bot-sdk` writes its internal logs to stdout by default, which corrupts the JSON-RPC channel stdio MCP servers communicate on. The plugin overrides `LogService` at boot to redirect everything to stderr. Don't remove that override, the server will start spraying log lines into the RPC stream and Claude Code will start seeing garbage.
 
 ---
 
@@ -171,13 +171,13 @@ If you'd rather not accept the risk, run the bot inside a container with no outb
 |---|---|---|
 | `MATRIX_HOMESERVER_URL` | ✓ | Base URL of your homeserver, e.g. `https://chat.example.com` |
 | `MATRIX_USER_ID` | ✓ | Bot's full Matrix ID, e.g. `@claude-bot:chat.example.com` |
-| `MATRIX_ROOM_ID` | ✓ | Encrypted room internal ID, e.g. `!abc123:chat.example.com` |
-| `MATRIX_PASSWORD` | one of pwd/token | Bot password (preferred — enables device-ID pinning) |
-| `MATRIX_ACCESS_TOKEN` | one of pwd/token | Existing access token (alternative to password) |
-| `MATRIX_RECOVERY_KEY` | optional | Bot's SSSS recovery key for automatic device verification |
-| `MATRIX_E2EE` | optional | `true` (default) or `false` — disable Olm if you only use plaintext rooms |
-| `MATRIX_STATE_DIR` | optional | Override state directory (default `~/.claude/channels/matrix-e2ee`) |
-| `MATRIX_ACCESS_MODE` | optional | `static` to read `access.json` once at startup |
+| `MATRIX_ROOM_ID` | ✓ | Internal ID of the encrypted room, e.g. `!abc123:chat.example.com` |
+| `MATRIX_PASSWORD` | one of pwd/token | Bot password. Preferred, since it enables device-ID pinning. |
+| `MATRIX_ACCESS_TOKEN` | one of pwd/token | Existing access token, if you don't want to store a password. |
+| `MATRIX_RECOVERY_KEY` | optional | Bot's SSSS recovery key, for automatic device verification. |
+| `MATRIX_E2EE` | optional | `true` (default) or `false`. Set `false` to disable Olm if you're only using plaintext rooms. |
+| `MATRIX_STATE_DIR` | optional | Override the state directory (default `~/.claude/channels/matrix-e2ee`). |
+| `MATRIX_ACCESS_MODE` | optional | `static` reads `access.json` once at startup instead of on every message. |
 
 ---
 
