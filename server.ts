@@ -647,6 +647,8 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
     return
   }
 
+  // Acknowledge receipt so the sender knows it landed before Claude replies
+  void sendReaction(ROOM_ID!, eventId, '👀').catch(() => {})
   void client.setTyping(ROOM_ID!, true, 5000).catch(() => {})
 
   const ts = event.origin_server_ts
