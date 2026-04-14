@@ -156,6 +156,9 @@ function assertAllowedRoom(roomId: string): void {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+// Maps the bot's sent permission-request event_id → request_id, so incoming
+// 👍/👎 reactions on that message can be resolved without a text reply.
+const permissionEventIds = new Map<string, string>()
 
 function chunkText(text: string, limit = 16000): string[] {
   if (text.length <= limit) return [text]
@@ -378,11 +381,12 @@ mcp.setNotificationHandler(
       description,
       preview,
       ``,
-      `Reply **yes ${request_id}** to allow or **no ${request_id}** to deny.`,
+      `React 👍 to allow or 👎 to deny. (Or reply **yes ${request_id}** / **no ${request_id}**)`,
     ].filter(l => l !== undefined).join('\n')
-    await sendText(ROOM_ID!, text).catch(err => {
+    const sentEventId = await sendText(ROOM_ID!, text).catch(err => {
       process.stderr.write(`matrix channel: permission_request send failed: ${err}\n`)
     })
+    if (sentEventId) permissionEventIds.set(sentEventId, request_id)
   },
 )
 
@@ -444,6 +448,10 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
       params: { request_id, behavior },
     })
     pendingPermissions.delete(request_id)
+    // Clean up the reverse-lookup entry if present
+    for (const [eid, rid] of permissionEventIds) {
+      if (rid === request_id) { permissionEventIds.delete(eid); break }
+    }
     void sendReaction(ROOM_ID!, eventId, behavior === 'allow' ? '✅' : '❌')
     return
   }
@@ -472,6 +480,58 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
 
 client.on('room.message', (roomId: string, event: InboundEvent) => {
   void handleMessage(roomId, event)
+})
+
+// --- Reaction-based permission approval ---
+
+interface ReactionEvent {
+  event_id?: string
+  sender?: string
+  type?: string
+  content?: {
+    'm.relates_to'?: {
+      rel_type?: string
+      event_id?: string
+      key?: string
+    }
+  }
+}
+
+async function handleReaction(roomId: string, event: ReactionEvent): Promise<void> {
+  if (roomId !== ROOM_ID) return
+  if (event.type !== 'm.reaction') return
+  if (!isAllowed(event.sender ?? '')) return
+
+  const relates = event.content?.['m.relates_to']
+  if (relates?.rel_type !== 'm.annotation') return
+
+  const targetEventId = relates.event_id
+  const key = relates.key
+  if (!targetEventId || !key) return
+
+  const request_id = permissionEventIds.get(targetEventId)
+  if (!request_id) return
+  if (!pendingPermissions.has(request_id)) return
+
+  let behavior: 'allow' | 'deny' | null = null
+  if (key === '👍' || key === '✅') behavior = 'allow'
+  else if (key === '👎' || key === '❌') behavior = 'deny'
+  if (!behavior) return
+
+  void mcp.notification({
+    method: 'notifications/claude/channel/permission',
+    params: { request_id, behavior },
+  })
+  pendingPermissions.delete(request_id)
+  permissionEventIds.delete(targetEventId)
+  // React on the original permission message to confirm receipt
+  void sendReaction(ROOM_ID!, targetEventId, behavior === 'allow' ? '✅' : '❌')
+}
+
+// room.event fires for all timeline events including m.reaction (which is not
+// surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
+client.on('room.event', (roomId: string, event: unknown) => {
+  void handleReaction(roomId, event as ReactionEvent)
 })
 
 client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
