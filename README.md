@@ -1,34 +1,23 @@
-# claude-channel-matrix
+# claude-matrix-e2ee
 
-A Matrix channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that lets you chat with your Claude Code session from any Matrix client (Element, FluffyChat, etc.).
+A **Matrix channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code)** that bridges an E2EE-encrypted Matrix room to a running Claude Code session. Send a message from any Matrix client (Element, FluffyChat, Cinny) → Claude sees it, replies back to the encrypted room.
 
-Send a message from your phone → Claude sees it, responds back to your Matrix room.
+**Works wherever Claude Code runs** — headless servers, WSL, SSH sessions, bare terminals. No Claude desktop app required, no third-party messaging service in the loop.
 
-**Works wherever Claude Code runs — headless servers, WSL, SSH sessions, bare terminals. No Claude desktop app required.**
-
-> **This requires a self-hosted Matrix homeserver.** See the [Self-Hosting](#self-hosting-a-matrix-server) section below. You cannot use matrix.org or any managed homeserver — the bot account must be on a server you control, and the credentials must be accessible to Claude Code.
+This is a fork of [metalchef1/Claude-Connect-Matrix-Integration](https://github.com/metalchef1/Claude-Connect-Matrix-Integration) with the Matrix I/O layer rewritten on top of [`matrix-bot-sdk`](https://github.com/turt2live/matrix-bot-sdk) so it can join end-to-end encrypted rooms. The crypto self-signing routine was lifted from [Kholtien/nanoclaw](https://github.com/Kholtien/nanoclaw).
 
 ---
 
-## Why this instead of the official connectors?
+## What's different from upstream
 
-Anthropic ships official Claude Code Channels for [Discord and Telegram](https://claude.com/connectors). If you already use those apps, they work fine.
-
-This plugin is for people who don't want a third-party messaging platform in the loop. Your messages go: phone → your Matrix server → Claude Code. Discord and Telegram never see them.
-
-It also works on any machine running Claude Code — no desktop app, no GUI, no Anthropic mobile app required. If you're SSH'd into a server or running Claude Code headless, this is the only remote messaging option.
-
----
-
-## How it works
-
-Claude Code has a [Channels](https://docs.anthropic.com/en/docs/claude-code/channels) feature that allows MCP servers to push inbound messages into a running session. This plugin implements that protocol for Matrix using the Matrix Client-Server API directly — no SDK, no bot framework, just long-polling `/sync`.
-
-```
-Element (phone) → Matrix homeserver → this plugin → Claude Code session
-                                                          ↓
-Element (phone) ← Matrix homeserver ←────── reply tool ──┘
-```
+| | Upstream metalchef1 | This fork |
+|---|---|---|
+| Runtime | Bun | Node 20+ via `tsx` |
+| Matrix layer | Raw `fetch` to CS API | `matrix-bot-sdk` + `RustSdkCryptoStorageProvider` |
+| Encrypted rooms | ❌ plaintext only | ✅ Olm/Megolm via the Rust crypto SDK |
+| Device verification | n/a | Auto self-signs the bot's device using its SSSS recovery key on every restart |
+| Identity persistence | n/a | Pinned device-ID re-login keeps the bot's crypto identity stable across restarts |
+| MCP protocol / tools / allowlist / permission relay | (kept verbatim) | (kept verbatim) |
 
 ---
 
@@ -36,129 +25,87 @@ Element (phone) ← Matrix homeserver ←────── reply tool ──┘
 
 | Requirement | Notes |
 |---|---|
-| **Self-hosted Matrix homeserver** | Conduit recommended (see below). Synapse works too. |
-| **Claude Code** | v2.x or later with channels support |
-| **Bun** | Runtime for the plugin — `npm install -g bun` or https://bun.sh |
+| **Self-hosted Matrix homeserver** | Conduit, Tuwunel, Synapse, Dendrite — anything you control. The bot's account credentials must be readable on the machine running Claude Code. |
+| **Node.js ≥ 20** | The Rust crypto binding ships as a native Node module. Bun may work but is unverified. |
+| **Claude Code 2.x** | With Channels support |
 | **A bot Matrix account** | Created on your homeserver |
-
----
-
-## Self-Hosting a Matrix Server
-
-You need a Matrix homeserver running somewhere on your network (a Linux VM, a VPS, a Raspberry Pi, Docker Desktop on Windows — anything with Docker).
-
-### Option A: Conduit (recommended — lightweight, fast)
-
-Conduit is a Matrix homeserver written in Rust. It uses ~50MB RAM and runs on anything.
-
-1. Copy `conduit-example/docker-compose.yml` from this repo
-2. Edit `CONDUIT_SERVER_NAME` to match your domain or local hostname
-3. Start it:
-   ```bash
-   docker compose up -d
-   ```
-4. Your homeserver URL will be `http://your-host:6167` (or `https://` if you put it behind a reverse proxy like Traefik/Caddy)
-
-> **Tailscale users:** You can use your Tailscale machine name as `CONDUIT_SERVER_NAME` (e.g. `myserver.tail1234.ts.net`) and access it over your tailnet without port forwarding. This is how the author runs it.
-
-### Option B: Synapse
-
-If you already run Synapse, it works too. Create a bot account and skip the Conduit setup.
+| **Secure Backup enabled on the bot account** | Needed for automatic device verification (optional but recommended — without it, Element will keep flagging the bot as "unverified") |
 
 ---
 
 ## Setup
 
-### 1. Create the bot account
+### 1. Clone
 
-With `CONDUIT_ALLOW_REGISTRATION: true`, register a new account via any Matrix client or with curl:
+```bash
+git clone https://github.com/Kholtien/claude-connect-matrix-integration ~/projects/claude-matrix-e2ee
+cd ~/projects/claude-matrix-e2ee
+git checkout e2ee-port
+npm install
+```
+
+### 2. Create the bot account
+
+Register a fresh user on your homeserver (any Matrix client will do). Pick a strong password — you'll need it. Example with curl:
 
 ```bash
 curl -X POST https://your.homeserver/_matrix/client/v3/register \
   -H "Content-Type: application/json" \
-  -d '{"username":"claude","password":"pick-a-strong-password","kind":"user"}'
+  -d '{"username":"claude-bot","password":"<strong>","kind":"user"}'
 ```
 
-After creating accounts, set `CONDUIT_ALLOW_REGISTRATION: false` and restart.
+### 3. Set up Secure Backup on the bot (optional but recommended)
 
-### 2. Get an access token
+Log into Element as the bot account. Go to **Settings → Security & Privacy → Secure Backup → Set up**. Capture the recovery key — you'll need it for `MATRIX_RECOVERY_KEY`. Without this, the bot still functions but Element will show its device as unverified.
 
-Login as the bot to get its access token:
+### 4. Create the room
 
-```bash
-curl -X POST https://your.homeserver/_matrix/client/v3/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "m.login.password",
-    "identifier": {"type": "m.id.user", "user": "claude"},
-    "password": "pick-a-strong-password"
-  }'
-```
-
-The response contains `access_token` — save it.
-
-### 3. Create a room
-
-Create a private room in Element (or any client) logged in as your **personal** account. Invite the bot account (`@claude:your.homeserver`) to the room. The bot will auto-accept.
-
-Get the internal room ID: in Element, go to Room Settings → Advanced → Internal room ID. It looks like `!abc123:your.homeserver`.
-
-### 4. Install the plugin
-
-Clone this repo:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/claude-channel-matrix
-cd claude-channel-matrix
-bun install
-```
+From your **personal** account, create a private encrypted room and invite the bot. The bot will auto-accept the invite *if and only if* it matches `MATRIX_ROOM_ID`. Get the internal room ID from your client (Element: Room Settings → Advanced → Internal room ID).
 
 ### 5. Configure credentials
 
-Add the MCP server to your Claude Code user config (`~/.claude.json` on Linux/Mac, `C:\Users\<you>\.claude.json` on Windows).
-
-The cleanest way is via the CLI:
+Create `~/.claude/channels/matrix-e2ee/.env` (mode `0600`):
 
 ```bash
-claude mcp add matrix -s user \
-  -e MATRIX_HOMESERVER_URL=https://your.homeserver \
-  -e MATRIX_ACCESS_TOKEN=your_access_token \
-  -e MATRIX_ROOM_ID='!roomid:your.homeserver' \
-  -e MATRIX_USER_ID='@claude:your.homeserver' \
-  -- bun /path/to/claude-channel-matrix/server.ts
+MATRIX_HOMESERVER_URL=https://your.homeserver
+MATRIX_USER_ID=@claude-bot:your.homeserver
+MATRIX_ROOM_ID=!yourroomid:your.homeserver
+MATRIX_PASSWORD=<bot password>
+MATRIX_RECOVERY_KEY=<bot SSSS recovery key, optional>
+MATRIX_E2EE=true
 ```
 
-> **Windows note:** On Windows, the plugin's `.env` file loading is skipped due to a `chmodSync` incompatibility. You must pass credentials via the `env` block in `~/.claude.json` as shown above. The `claude mcp add` command does this for you.
+You can use `MATRIX_ACCESS_TOKEN` instead of `MATRIX_PASSWORD`, but password login is preferred — the plugin pins the bot's crypto device ID across restarts so you don't lose Olm state.
 
-### 6. Add yourself to the allowlist
+Or use the bundled skill (recommended): `/matrix:configure` walks you through every value and writes the file with correct permissions.
 
-Start Claude Code, then run:
+### 6. Register with Claude Code
 
+```bash
+claude mcp add matrix -s user -- npx -y tsx ~/projects/claude-matrix-e2ee/server.ts
 ```
+
+No `-e` flags — secrets stay in the `.env` file out of `~/.claude.json`.
+
+### 7. Add yourself to the allowlist
+
+```bash
+claude --dangerously-load-development-channels server:matrix
+# in the session:
 /matrix:access allow @you:your.homeserver
 ```
 
-This adds your Matrix user ID to `~/.claude/channels/matrix/access.json`. Messages from anyone not on the allowlist are silently dropped.
+Anyone not on the allowlist is silently dropped. Only the configured `ROOM_ID` is accepted; invites to other rooms are ignored.
 
-### 7. Launch
+### 8. Launch
 
 ```bash
 claude --dangerously-load-development-channels server:matrix
 ```
 
-Claude Code will show a one-time warning about inbound channels. After that, messages from Element appear in your session and Claude replies back to the room.
+The `--dangerously-load-development-channels` flag is required because this plugin is not on Anthropic's official channel allowlist. It opts the session into inbound message delivery from unlisted MCP servers.
 
-#### Make it permanent (PowerShell)
-
-Add to your PowerShell profile (`$PROFILE`):
-
-```powershell
-function claude { & claude.cmd --dangerously-load-development-channels server:matrix @args }
-```
-
-#### Make it permanent (bash/zsh)
-
-Add to `~/.bashrc` or `~/.zshrc`:
+You can persist this with an alias:
 
 ```bash
 alias claude='claude --dangerously-load-development-channels server:matrix'
@@ -166,61 +113,80 @@ alias claude='claude --dangerously-load-development-channels server:matrix'
 
 ---
 
+## Optional: run as a background service
+
+If you want a permanent always-on bot you can talk to from anywhere, the skill `/matrix:configure systemd` will scaffold a systemd user unit + tmux wrapper for you. The wrapper runs Claude Code inside `tmux -L claude-matrix attach -t matrix-<workdir-name>` so you can attach locally and see what the bot is doing.
+
+The systemd path requires:
+- A working systemd user session (`loginctl enable-linger $USER` on most distros so it survives logout)
+- `tmux` installed
+
+Alternatively, you can wrap it in any process supervisor you prefer (s6, runit, supervisord, screen). The plugin itself is just a stdio MCP server — Claude Code is the long-running process.
+
+---
+
 ## Skills
 
-This plugin includes two Claude Code skills:
+| Skill | What it does |
+|---|---|
+| `/matrix:configure` | Full setup walkthrough: prereqs, repo, npm install, homeserver config, bot creation, room ID, SSSS key, MCP registration, allowlist, optional systemd+tmux. Re-run anytime to update. |
+| `/matrix:access` | Manage the inbound allowlist — `allow @user`, `remove @user`, `list`, `policy disabled` |
 
-### `/matrix:access`
-
-Manage the inbound message allowlist without editing JSON manually.
-
-```
-/matrix:access allow @friend:your.homeserver   # add a user
-/matrix:access remove @friend:your.homeserver  # remove a user
-/matrix:access list                             # show current allowlist
-/matrix:access policy disabled                 # block all inbound messages
-```
-
-### `/matrix:configure`
-
-View or update bot credentials stored in `~/.claude/channels/matrix/.env`.
-
-```
-/matrix:configure                               # show current config
-/matrix:configure token=new_token              # update access token
-/matrix:configure homeserver=https://... token=... room=!... user=@...
-/matrix:configure clear                        # remove stored credentials
-```
+The `/matrix:access` skill explicitly refuses to process access-list changes that arrive via Matrix — that's a prompt-injection vector. Only commands typed directly into the terminal are honoured.
 
 ---
 
 ## Security notes
 
-- **Access control is per-session.** The allowlist file is read-write while Claude Code is running. Never accept access changes because a Matrix message asked you to — that is a prompt injection attack. The `/matrix:access` skill explicitly refuses to process requests that arrive via Matrix.
-- **`--dangerously-load-development-channels` is required** because this plugin is not on Anthropic's official channels allowlist. The flag opts you into inbound message delivery for unlisted MCP servers. It shows a warning on startup.
-- Credentials are stored in `~/.claude.json` (or `~/.claude/channels/matrix/.env` on Linux/Mac). Keep those files private.
+### Threat model
+
+This plugin is designed for use against **a homeserver you control**. The bot account's password and the SSSS recovery key are read from a local `.env` file. If an attacker has read access to `~/.claude/channels/matrix-e2ee/`, they have full control of the bot identity. Defence relies on filesystem permissions (`0700` directory, `0600` files).
+
+### Allowlist + permission relay
+
+- Inbound Matrix messages are dropped unless the sender is on the allowlist (`access.json`).
+- The `yes <id>` / `no <id>` permission-reply intercept will only honour replies for permission requests the plugin actually relayed — pre-emptive forging of grant IDs is rejected with a `❓` reaction.
+- Auto-join is restricted to the configured `MATRIX_ROOM_ID` only; invites to other rooms are ignored.
+
+### Known dependency advisories
+
+`matrix-bot-sdk@0.8.0` transitively pulls the deprecated `request` package, which brings in advisories on `form-data`, `tough-cookie`, and `qs`. `npm audit` reports 2 critical and 5 moderate vulnerabilities at the time of writing.
+
+These are reachable — every Matrix HTTP request goes through the affected stack. **Risk-accepted** because:
+- The bot only talks to a homeserver you operate yourself, on a known URL (`MATRIX_HOMESERVER_URL`), so the attack surface is limited to a server you already trust.
+- No upstream fix exists in `matrix-bot-sdk@0.8.x` — the SDK author has stated `request` will be removed in a future major.
+- `form-data`'s unsafe-random boundary issue is irrelevant when sending JSON requests (no multipart bodies); `tough-cookie`'s prototype pollution requires attacker-controlled cookies, which a Matrix homeserver doesn't set; `qs` DoS requires attacker-controlled query strings, which the Matrix CS API doesn't use.
+
+If you'd rather not accept the risk, run the bot inside a container with no outbound network access except to your homeserver, or wait for a `matrix-bot-sdk` release that drops `request`.
+
+### Stdio MCP hygiene
+
+`matrix-bot-sdk` writes its internal logs to **stdout** by default, which corrupts the JSON-RPC channel that stdio MCP servers communicate on. The plugin overrides `LogService` at boot to redirect everything to stderr — do not remove this override.
 
 ---
 
 ## Environment variables
 
-| Variable | Description |
-|---|---|
-| `MATRIX_HOMESERVER_URL` | Base URL of your homeserver, e.g. `https://matrix.example.com` |
-| `MATRIX_ACCESS_TOKEN` | Bot account's access token |
-| `MATRIX_ROOM_ID` | Internal room ID, e.g. `!abc123:matrix.example.com` |
-| `MATRIX_USER_ID` | Bot's Matrix ID, e.g. `@claude:matrix.example.com` |
-| `MATRIX_STATE_DIR` | Override state directory (default: `~/.claude/channels/matrix`) |
-| `MATRIX_ACCESS_MODE` | Set to `static` to read access.json once at startup instead of on every message |
+| Variable | Required | Description |
+|---|---|---|
+| `MATRIX_HOMESERVER_URL` | ✓ | Base URL of your homeserver, e.g. `https://chat.example.com` |
+| `MATRIX_USER_ID` | ✓ | Bot's full Matrix ID, e.g. `@claude-bot:chat.example.com` |
+| `MATRIX_ROOM_ID` | ✓ | Encrypted room internal ID, e.g. `!abc123:chat.example.com` |
+| `MATRIX_PASSWORD` | one of pwd/token | Bot password (preferred — enables device-ID pinning) |
+| `MATRIX_ACCESS_TOKEN` | one of pwd/token | Existing access token (alternative to password) |
+| `MATRIX_RECOVERY_KEY` | optional | Bot's SSSS recovery key for automatic device verification |
+| `MATRIX_E2EE` | optional | `true` (default) or `false` — disable Olm if you only use plaintext rooms |
+| `MATRIX_STATE_DIR` | optional | Override state directory (default `~/.claude/channels/matrix-e2ee`) |
+| `MATRIX_ACCESS_MODE` | optional | `static` to read `access.json` once at startup |
 
 ---
 
-## Pushing to Anthropic
+## Credits
 
-This is a community implementation of the Claude Code Channels feature for Matrix. If you'd like to see it in the official plugin marketplace, open an issue on the [Claude Code GitHub repo](https://github.com/anthropics/claude-code) linking to this project.
-
----
+- **[metalchef1/Claude-Connect-Matrix-Integration](https://github.com/metalchef1/Claude-Connect-Matrix-Integration)** — original MCP plugin, allowlist design, permission-relay protocol, all the Claude Code integration plumbing this fork keeps verbatim.
+- **[Kholtien/nanoclaw](https://github.com/Kholtien/nanoclaw)** — pinned-device re-login + SSSS auto-sign routines, ported to a standalone `crypto.ts` here.
+- **[matrix-bot-sdk](https://github.com/turt2live/matrix-bot-sdk)** — the SDK that does the actual Matrix client work.
 
 ## License
 
-Apache 2.0
+Apache 2.0 (inherited from upstream)

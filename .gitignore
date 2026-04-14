@@ -1,2 +1,16 @@
 node_modules/
 bun.lock
+
+# Runtime state — never commit
+access.json
+.env
+matrix-token
+bot-state.json
+bot-state.json.tmp
+matrix-crypto/
+*.token
+
+# Build / OS
+dist/
+.DS_Store
+*.log

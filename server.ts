@@ -1,12 +1,14 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
- * Matrix channel for Claude Code.
+ * Matrix channel for Claude Code — E2EE-capable.
  *
  * Self-contained MCP server that bridges a Matrix room to a Claude Code session.
- * Uses the Matrix Client-Server API directly (no SDK needed).
- * State lives in ~/.claude/channels/matrix/ — managed by the /matrix:access skill.
+ * Uses matrix-bot-sdk with RustSdkCryptoStorageProvider for encrypted rooms.
+ * State lives in ~/.claude/channels/matrix-e2ee/ — managed by the /matrix:access skill.
  *
- * Requires: MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID, MATRIX_USER_ID
+ * Required env: MATRIX_HOMESERVER_URL, MATRIX_ROOM_ID, MATRIX_USER_ID
+ * One of: MATRIX_ACCESS_TOKEN, or (MATRIX_PASSWORD + username derived from MATRIX_USER_ID)
+ * Optional: MATRIX_RECOVERY_KEY (SSSS key for autoSignDevice)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -22,34 +24,72 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import {
+  LogService,
+  LogLevel,
+  MatrixClient,
+  RustSdkCryptoStorageProvider,
+  SimpleFsStorageProvider,
+} from 'matrix-bot-sdk'
+import { StoreType as RustSdkCryptoStoreType } from '@matrix-org/matrix-sdk-crypto-nodejs'
 
-const STATE_DIR = process.env.MATRIX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'matrix')
+// matrix-bot-sdk's default logger writes to stdout, which corrupts the stdio
+// MCP JSON-RPC channel. Redirect everything to stderr.
+const fmt = (m: string, a: unknown[]) =>
+  `[mbs] ${m}${a.length ? ' ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') : ''}\n`
+LogService.setLogger({
+  info: (m: string, ...a: unknown[]) => process.stderr.write(fmt(m, a)),
+  warn: (m: string, ...a: unknown[]) => process.stderr.write(fmt(m, a)),
+  error: (m: string, ...a: unknown[]) => process.stderr.write(fmt(m, a)),
+  debug: () => {},
+  trace: () => {},
+})
+LogService.setLevel(LogLevel.WARN)
+import { relogWithPinnedDevice, autoSignDevice } from './crypto.js'
+
+const STATE_DIR = process.env.MATRIX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'matrix-e2ee')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 
-// Load ~/.claude/channels/matrix/.env into process.env. Real env wins.
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+
+// Load state-dir .env into process.env. Real env wins.
+// Tighten perms if the file exists; ignore failures (Windows, missing file)
+// without swallowing a successful read.
+try { chmodSync(ENV_FILE, 0o600) } catch {}
 try {
-  chmodSync(ENV_FILE, 0o600)
-  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  for (const rawLine of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
+    if (!m) continue
+    let value = m[2]
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    if (process.env[m[1]] === undefined) process.env[m[1]] = value
   }
 } catch {}
 
 const HOMESERVER = process.env.MATRIX_HOMESERVER_URL
-const ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN
 const ROOM_ID = process.env.MATRIX_ROOM_ID
 const BOT_USER_ID = process.env.MATRIX_USER_ID
 const STATIC = process.env.MATRIX_ACCESS_MODE === 'static'
+const PASSWORD = process.env.MATRIX_PASSWORD
+const RECOVERY_KEY = process.env.MATRIX_RECOVERY_KEY
+const E2EE = (process.env.MATRIX_E2EE ?? 'true') !== 'false'
+let ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN
 
-if (!HOMESERVER || !ACCESS_TOKEN || !ROOM_ID || !BOT_USER_ID) {
+if (!HOMESERVER || !ROOM_ID || !BOT_USER_ID || (!ACCESS_TOKEN && !PASSWORD)) {
   process.stderr.write(
     `matrix channel: required env vars missing\n` +
     `  set in ${ENV_FILE}:\n` +
     `    MATRIX_HOMESERVER_URL=https://your.server\n` +
-    `    MATRIX_ACCESS_TOKEN=<bot token>\n` +
     `    MATRIX_ROOM_ID=!roomid:your.server\n` +
-    `    MATRIX_USER_ID=@botname:your.server\n`,
+    `    MATRIX_USER_ID=@botname:your.server\n` +
+    `    MATRIX_ACCESS_TOKEN=<token>  # or MATRIX_PASSWORD=<pwd>\n` +
+    `    MATRIX_RECOVERY_KEY=<SSSS key>  # optional, for E2EE device verification\n`,
   )
   process.exit(1)
 }
@@ -61,91 +101,11 @@ process.on('uncaughtException', err => {
   process.stderr.write(`matrix channel: uncaught exception: ${err}\n`)
 })
 
-// --- Matrix Client-Server API helpers ---
-
-async function matrixFetch(
-  method: string,
-  path: string,
-  body?: unknown,
-  params?: Record<string, string>,
-): Promise<unknown> {
-  const url = new URL(`${HOMESERVER}${path}`)
-  if (params) {
-    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
-  }
-  const res = await fetch(url.toString(), {
-    method,
-    headers: {
-      'Authorization': `Bearer ${ACCESS_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: body != null ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`Matrix ${method} ${path} → ${res.status}: ${text}`)
-  }
-  return res.json()
-}
-
-let txnCounter = Date.now()
-function nextTxnId(): string {
-  return `cc-matrix-${txnCounter++}`
-}
-
-async function sendMessage(
-  roomId: string,
-  body: string,
-  relatesTo?: unknown,
-): Promise<string> {
-  const content: Record<string, unknown> = { msgtype: 'm.text', body }
-  if (relatesTo) content['m.relates_to'] = relatesTo
-  const res = await matrixFetch(
-    'PUT',
-    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${nextTxnId()}`,
-    content,
-  ) as { event_id: string }
-  return res.event_id
-}
-
-async function sendReaction(roomId: string, eventId: string, emoji: string): Promise<void> {
-  await matrixFetch(
-    'PUT',
-    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.reaction/${nextTxnId()}`,
-    { 'm.relates_to': { rel_type: 'm.annotation', event_id: eventId, key: emoji } },
-  )
-}
-
-async function editMessage(roomId: string, eventId: string, newBody: string): Promise<void> {
-  await matrixFetch(
-    'PUT',
-    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${nextTxnId()}`,
-    {
-      msgtype: 'm.text',
-      body: `* ${newBody}`,
-      'm.new_content': { msgtype: 'm.text', body: newBody },
-      'm.relates_to': { rel_type: 'm.replace', event_id: eventId },
-    },
-  )
-}
-
-async function acceptInvite(roomId: string): Promise<void> {
-  await matrixFetch('POST', `/_matrix/client/v3/join/${encodeURIComponent(roomId)}`)
-}
-
-async function sendTyping(roomId: string): Promise<void> {
-  await matrixFetch(
-    'PUT',
-    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/typing/${encodeURIComponent(BOT_USER_ID!)}`,
-    { typing: true, timeout: 5000 },
-  ).catch(() => {})
-}
-
-// --- Access control ---
+// --- Access control (verbatim from metalchef1) ---
 
 type Access = {
   policy: 'allowlist' | 'disabled'
-  allowFrom: string[]  // Matrix user IDs: @user:server
+  allowFrom: string[]
 }
 
 function defaultAccess(): Access {
@@ -183,7 +143,7 @@ function saveAccess(a: Access): void {
 }
 
 function isAllowed(userId: string): boolean {
-  if (userId === BOT_USER_ID) return false  // never deliver our own messages
+  if (userId === BOT_USER_ID) return false
   const access = loadAccess()
   if (access.policy === 'disabled') return false
   return access.allowFrom.includes(userId)
@@ -193,25 +153,10 @@ function assertAllowedRoom(roomId: string): void {
   if (roomId !== ROOM_ID) throw new Error(`room ${roomId} is not the configured room`)
 }
 
-function assertSendable(f: string): void {
-  let real: string, stateReal: string
-  try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return }
-  if (real.startsWith(stateReal + sep)) {
-    throw new Error(`refusing to send channel state file: ${f}`)
-  }
-}
-
-// 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
-// Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-// Stores pending permission details keyed by request_id
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
-// Split long messages at paragraph/line/word boundaries
 function chunkText(text: string, limit = 16000): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -226,6 +171,82 @@ function chunkText(text: string, limit = 16000): string[] {
   }
   if (rest) out.push(rest)
   return out
+}
+
+// --- Matrix client setup ---
+
+if (PASSWORD) {
+  const localpart = BOT_USER_ID!.startsWith('@') ? BOT_USER_ID!.slice(1).split(':')[0] : BOT_USER_ID!
+  try {
+    const result = await relogWithPinnedDevice({
+      homeserverUrl: HOMESERVER!,
+      username: localpart,
+      password: PASSWORD,
+      storeDir: STATE_DIR,
+      existingToken: ACCESS_TOKEN ?? null,
+    })
+    ACCESS_TOKEN = result.accessToken
+    process.stderr.write(`matrix channel: pinned-device login OK (device=${result.deviceId ?? 'new'})\n`)
+  } catch (err) {
+    process.stderr.write(`matrix channel: pinned-device login failed: ${err}\n`)
+    process.exit(1)
+  }
+}
+
+const storage = new SimpleFsStorageProvider(join(STATE_DIR, 'bot-state.json'))
+
+let cryptoStore: RustSdkCryptoStorageProvider | undefined
+if (E2EE) {
+  try {
+    cryptoStore = new RustSdkCryptoStorageProvider(
+      join(STATE_DIR, 'matrix-crypto'),
+      RustSdkCryptoStoreType.Sqlite,
+    )
+  } catch (err) {
+    process.stderr.write(`matrix channel: failed to init crypto store: ${err}\n`)
+    process.exit(1)
+  }
+}
+
+const client = new MatrixClient(HOMESERVER!, ACCESS_TOKEN!, storage, cryptoStore)
+
+// Only auto-join invites to the configured room. Avoids leaking bot presence
+// into unrelated rooms if anyone discovers the bot's user ID.
+client.on('room.invite', (roomId: string) => {
+  if (roomId !== ROOM_ID) {
+    process.stderr.write(`matrix channel: ignoring invite to non-configured room ${roomId}\n`)
+    return
+  }
+  void client.joinRoom(roomId).catch(err => {
+    process.stderr.write(`matrix channel: failed to join ${roomId}: ${err}\n`)
+  })
+})
+
+async function sendText(roomId: string, body: string): Promise<string> {
+  return client.sendText(roomId, body)
+}
+
+async function sendReply(roomId: string, body: string, replyTo: string): Promise<string> {
+  return client.sendMessage(roomId, {
+    msgtype: 'm.text',
+    body,
+    'm.relates_to': { 'm.in_reply_to': { event_id: replyTo } },
+  })
+}
+
+async function sendReaction(roomId: string, eventId: string, emoji: string): Promise<void> {
+  await client.sendEvent(roomId, 'm.reaction', {
+    'm.relates_to': { rel_type: 'm.annotation', event_id: eventId, key: emoji },
+  })
+}
+
+async function editMessage(roomId: string, eventId: string, newBody: string): Promise<void> {
+  await client.sendMessage(roomId, {
+    msgtype: 'm.text',
+    body: `* ${newBody}`,
+    'm.new_content': { msgtype: 'm.text', body: newBody },
+    'm.relates_to': { rel_type: 'm.replace', event_id: eventId },
+  })
 }
 
 // --- MCP Server ---
@@ -305,10 +326,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunkText(text)
         const sentIds: string[] = []
         for (let i = 0; i < chunks.length; i++) {
-          const relatesTo = reply_to && i === 0
-            ? { 'm.in_reply_to': { event_id: reply_to } }
-            : undefined
-          const id = await sendMessage(room_id, chunks[i], relatesTo)
+          const id = reply_to && i === 0
+            ? await sendReply(room_id, chunks[i], reply_to)
+            : await sendText(room_id, chunks[i])
           sentIds.push(id)
         }
         const result = sentIds.length === 1
@@ -360,23 +380,118 @@ mcp.setNotificationHandler(
       ``,
       `Reply **yes ${request_id}** to allow or **no ${request_id}** to deny.`,
     ].filter(l => l !== undefined).join('\n')
-    await sendMessage(ROOM_ID!, text).catch(err => {
+    await sendText(ROOM_ID!, text).catch(err => {
       process.stderr.write(`matrix channel: permission_request send failed: ${err}\n`)
     })
   },
 )
 
-// --- Sync loop ---
+// --- Inbound handler (replaces sync long-poll loop) ---
 
-await mcp.connect(new StdioServerTransport())
+const handledEventIds = new Set<string>()
 
-let syncToken: string | undefined
+interface InboundEvent {
+  event_id?: string
+  sender?: string
+  type?: string
+  origin_server_ts?: number
+  content?: {
+    msgtype?: string
+    body?: string
+    'm.relates_to'?: unknown
+    'm.new_content'?: unknown
+  }
+}
+
+async function handleMessage(roomId: string, event: InboundEvent): Promise<void> {
+  const eventId = event.event_id
+  if (!eventId) return
+  if (handledEventIds.has(eventId)) return
+  handledEventIds.add(eventId)
+  if (handledEventIds.size > 500) {
+    const first = handledEventIds.values().next().value
+    if (first) handledEventIds.delete(first)
+  }
+
+  if (roomId !== ROOM_ID) return
+  if (!event.content) return
+  if (event.content.msgtype !== 'm.text') return
+  if (event.sender === BOT_USER_ID) return
+  if (event.content['m.relates_to']) return
+  if (event.content['m.new_content']) return
+
+  const body = event.content.body
+  if (!body) return
+
+  if (!isAllowed(event.sender ?? '')) {
+    process.stderr.write(`matrix channel: dropped message from unlisted user ${event.sender}\n`)
+    return
+  }
+
+  const permMatch = PERMISSION_REPLY_RE.exec(body)
+  if (permMatch) {
+    const request_id = permMatch[2]!.toLowerCase()
+    // Only honour replies for permission requests we actually relayed. Without
+    // this gate, an allowlisted Matrix user could forge a grant for a future
+    // request_id by sending `yes <guess>` ahead of time.
+    if (!pendingPermissions.has(request_id)) {
+      void sendReaction(ROOM_ID!, eventId, '❓')
+      return
+    }
+    const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id, behavior },
+    })
+    pendingPermissions.delete(request_id)
+    void sendReaction(ROOM_ID!, eventId, behavior === 'allow' ? '✅' : '❌')
+    return
+  }
+
+  void client.setTyping(ROOM_ID!, true, 5000).catch(() => {})
+
+  const ts = event.origin_server_ts
+    ? new Date(event.origin_server_ts).toISOString()
+    : new Date().toISOString()
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: body,
+      meta: {
+        room_id: ROOM_ID,
+        event_id: eventId,
+        user: event.sender,
+        ts,
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`matrix channel: failed to deliver to Claude: ${err}\n`)
+  })
+}
+
+client.on('room.message', (roomId: string, event: InboundEvent) => {
+  void handleMessage(roomId, event)
+})
+
+client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
+  if (event?.type === 'm.room.message') void handleMessage(roomId, event)
+})
+
+client.on('room.failed_decryption', (roomId: string, event: InboundEvent, err: Error) => {
+  process.stderr.write(
+    `matrix channel: failed to decrypt event ${event?.event_id} in ${roomId}: ${err?.message}\n`,
+  )
+})
+
+// --- Boot ---
+
 let shuttingDown = false
-
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('matrix channel: shutting down\n')
+  client.stop()
   setTimeout(() => process.exit(0), 1000)
 }
 process.stdin.on('end', shutdown)
@@ -384,135 +499,22 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-// Bootstrap: fast sync to get current position (skip backlog) and accept room invite
-async function bootstrap(): Promise<void> {
+await mcp.connect(new StdioServerTransport())
+
+await client.start()
+process.stderr.write(`matrix channel: connected as ${BOT_USER_ID}, watching ${ROOM_ID}\n`)
+
+if (E2EE && RECOVERY_KEY) {
   try {
-    const res = await matrixFetch('GET', '/_matrix/client/v3/sync', undefined, {
-      timeout: '0',
-      filter: JSON.stringify({ room: { timeline: { limit: 0 }, state: { limit: 0 } } }),
-    }) as { next_batch: string; rooms?: { invite?: Record<string, unknown> } }
-
-    // Accept pending invite for our room
-    const invited = res.rooms?.invite ?? {}
-    if (ROOM_ID && ROOM_ID in invited) {
-      process.stderr.write(`matrix channel: accepting invite to ${ROOM_ID}\n`)
-      await acceptInvite(ROOM_ID).catch(err =>
-        process.stderr.write(`matrix channel: failed to join room: ${err}\n`),
-      )
-    }
-
-    syncToken = res.next_batch
-    process.stderr.write(`matrix channel: connected as ${BOT_USER_ID}, syncing from ${syncToken}\n`)
+    await autoSignDevice({
+      client,
+      homeserverUrl: HOMESERVER!,
+      accessToken: ACCESS_TOKEN!,
+      userId: BOT_USER_ID!,
+      recoveryKey: RECOVERY_KEY,
+    })
+    process.stderr.write('matrix channel: device auto-signed\n')
   } catch (err) {
-    process.stderr.write(`matrix channel: bootstrap failed: ${err}\n`)
-    process.exit(1)
+    process.stderr.write(`matrix channel: auto-sign failed (bot still functional): ${err}\n`)
   }
 }
-
-await bootstrap()
-
-// Main sync loop — long-poll for new events in the configured room
-void (async () => {
-  for (let attempt = 1; !shuttingDown; ) {
-    try {
-      const res = await matrixFetch('GET', '/_matrix/client/v3/sync', undefined, {
-        since: syncToken!,
-        timeout: '30000',
-        filter: JSON.stringify({
-          room: {
-            rooms: [ROOM_ID],
-            timeline: { limit: 50, types: ['m.room.message'] },
-          },
-        }),
-      }) as {
-        next_batch: string
-        rooms?: {
-          join?: Record<string, {
-            timeline?: {
-              events?: Array<{
-                event_id: string
-                sender: string
-                type: string
-                content: {
-                  msgtype?: string
-                  body?: string
-                  'm.relates_to'?: unknown
-                  'm.new_content'?: unknown
-                }
-                origin_server_ts: number
-              }>
-            }
-          }>
-          invite?: Record<string, unknown>
-        }
-      }
-
-      syncToken = res.next_batch
-      attempt = 1  // reset backoff on success
-
-      // Accept new invites (e.g. if kicked and re-invited)
-      const invited = res.rooms?.invite ?? {}
-      if (ROOM_ID && ROOM_ID in invited) {
-        await acceptInvite(ROOM_ID).catch(() => {})
-      }
-
-      // Process messages
-      const events = res.rooms?.join?.[ROOM_ID!]?.timeline?.events ?? []
-      for (const event of events) {
-        if (event.type !== 'm.room.message') continue
-        if (event.sender === BOT_USER_ID) continue           // skip our own messages
-        if (event.content['m.relates_to']) continue          // skip edits/reactions
-        if (event.content['m.new_content']) continue         // skip replacement events
-        if (event.content.msgtype !== 'm.text') continue
-        const body = event.content.body
-        if (!body) continue
-
-        if (!isAllowed(event.sender)) {
-          process.stderr.write(`matrix channel: dropped message from unlisted user ${event.sender}\n`)
-          continue
-        }
-
-        // Permission-reply intercept: "yes xxxxx" / "no xxxxx" answers a pending permission request
-        // instead of being forwarded to Claude as a chat message.
-        const permMatch = PERMISSION_REPLY_RE.exec(body)
-        if (permMatch) {
-          const request_id = permMatch[2]!.toLowerCase()
-          const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
-          void mcp.notification({
-            method: 'notifications/claude/channel/permission',
-            params: { request_id, behavior },
-          })
-          pendingPermissions.delete(request_id)
-          void sendReaction(ROOM_ID!, event.event_id, behavior === 'allow' ? '✅' : '❌')
-          continue
-        }
-
-        // Typing indicator — fire and forget
-        void sendTyping(ROOM_ID!)
-
-        const ts = new Date(event.origin_server_ts).toISOString()
-
-        mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: body,
-            meta: {
-              room_id: ROOM_ID,
-              event_id: event.event_id,
-              user: event.sender,
-              ts,
-            },
-          },
-        }).catch(err => {
-          process.stderr.write(`matrix channel: failed to deliver to Claude: ${err}\n`)
-        })
-      }
-    } catch (err) {
-      if (shuttingDown) return
-      const delay = Math.min(1000 * attempt, 15000)
-      process.stderr.write(`matrix channel: sync error (retry in ${delay}ms): ${err}\n`)
-      await new Promise(r => setTimeout(r, delay))
-      attempt++
-    }
-  }
-})()
