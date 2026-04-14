@@ -733,7 +733,9 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
     '7\u20E3': '7️⃣', '8\u20E3': '8️⃣', '9\u20E3': '9️⃣',
   }
   const canonicalNumber = NUMBER_EMOJI_MAP[normalizedKey]
-  if (canonicalNumber && botSentEventIds.has(targetEventId)) {
+  // No botSentEventIds check — the allowlist already gates who can react,
+  // and this is a private two-person room. Any allowlisted number reaction is a selection.
+  if (canonicalNumber) {
     const ts = new Date().toISOString()
     void mcp.notification({
       method: 'notifications/claude/channel',
@@ -755,15 +757,8 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 
 // room.event fires for all timeline events including m.reaction (which is not
 // surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
-import { appendFileSync } from 'fs'
 client.on('room.event', (roomId: string, event: unknown) => {
-  const e = event as ReactionEvent
-  if (e.type === 'm.reaction') {
-    const k = e.content?.['m.relates_to']?.key ?? ''
-    const bytes = Buffer.from(k).toString('hex')
-    try { appendFileSync(join(STATE_DIR, 'event-debug.log'), `${new Date().toISOString()} reaction key=${JSON.stringify(k)} hex=${bytes}\n`) } catch {}
-  }
-  void handleReaction(roomId, e)
+  void handleReaction(roomId, event as ReactionEvent)
 })
 
 client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
