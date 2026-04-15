@@ -25,7 +25,11 @@ import {
 import { exec as execCallback, spawn } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
-import { join, sep, basename } from 'path'
+import { join, sep, basename, dirname } from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const CONTEXT_SCRIPT = join(__dirname, 'scripts', 'check-context.sh')
 import { createServer as createHttpServer } from 'http'
 
 const execAsync = promisify(execCallback)
@@ -284,11 +288,11 @@ function formatUsageReply(data: UsageData): string {
 
   const fivePct = Math.round((data.five_hour?.utilization ?? 0))
   const fiveReset = formatResetTime(data.five_hour?.resets_at, 'time')
-  lines.push(`Current (5h):  ${fivePct}%${fiveReset ? ` — resets ${fiveReset}` : ''}`)
+  lines.push(`- **Current (5h):** ${fivePct}%${fiveReset ? ` — resets ${fiveReset}` : ''}`)
 
   const sevenPct = Math.round((data.seven_day?.utilization ?? 0))
   const sevenReset = formatResetTime(data.seven_day?.resets_at, 'datetime')
-  lines.push(`Weekly (7d):   ${sevenPct}%${sevenReset ? ` — resets ${sevenReset}` : ''}`)
+  lines.push(`- **Weekly (7d):** ${sevenPct}%${sevenReset ? ` — resets ${sevenReset}` : ''}`)
 
   const extra = data.extra_usage
   if (extra?.is_enabled) {
@@ -299,7 +303,7 @@ function formatUsageReply(data: UsageData): string {
     const now = new Date()
     const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1)
     const resetStr = nextMonth.toLocaleDateString('en-AU', { timeZone: 'Australia/Sydney', month: 'short', day: 'numeric' })
-    lines.push(`Extra:         $${used} / $${limit} (${extraPct}%) — resets ${resetStr}`)
+    lines.push(`- **Extra:** $${used} / $${limit} (${extraPct}%) — resets ${resetStr}`)
   }
 
   return lines.join('\n')
@@ -341,8 +345,8 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
           `State: ${state}`,
           `PID: ${pid}`,
           `Up since: ${upSince}`,
-          `Session: tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}`,
-        ].join('\n'))
+          `Session: \`tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}\``,
+        ].join('  \n'))
       } catch (err) {
         await sendText(ROOM_ID!, `status failed: ${err}`)
       }
@@ -353,11 +357,18 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
       const flag = args === 'all' ? '--all' : ''
       try {
         const { stdout } = await execAsync(
-          `/home/colton/.local/bin/check-context.sh ${flag}`,
+          `${CONTEXT_SCRIPT} ${flag}`,
           { cwd: process.cwd() },
         )
         const clean = stripAnsi(stdout).trim()
-        await sendText(ROOM_ID!, clean.length ? `\`\`\`\n${clean}\n\`\`\`` : 'No context data found.')
+        if (!clean.length) {
+          await sendText(ROOM_ID!, 'No context data found.')
+        } else {
+          // Extract all percentages (one per session), append as a simple summary
+          const pcts = [...clean.matchAll(/\]\s*(\d+)%/g)].map(m => `${m[1]}%`)
+          const summary = pcts.length ? `\n**${pcts.join(' · ')}**` : ''
+          await sendText(ROOM_ID!, `\`\`\`\n${clean}\n\`\`\`${summary}`)
+        }
       } catch (err) {
         await sendText(ROOM_ID!, `context check failed: ${err}`)
       }
@@ -386,7 +397,7 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
 
     case 'model': {
       if (!args) {
-        await sendText(ROOM_ID!, 'Usage: `!model <name>`\nAliases: opus, sonnet, haiku (or full model ID)')
+        await sendText(ROOM_ID!, 'Usage: `!model <name>`  \nAliases: `opus`, `sonnet`, `haiku` (or full model ID)')
         return true
       }
       const modelId = MODEL_ALIASES[args.toLowerCase()] ?? args
