@@ -20,12 +20,13 @@ import {
 import { z } from 'zod'
 import {
   readFileSync, writeFileSync, mkdirSync,
-  renameSync, realpathSync, chmodSync,
+  renameSync, realpathSync, chmodSync, statSync,
 } from 'fs'
 import { exec as execCallback, spawn } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
+import { createServer as createHttpServer } from 'http'
 
 const execAsync = promisify(execCallback)
 import {
@@ -36,6 +37,11 @@ import {
   SimpleFsStorageProvider,
 } from 'matrix-bot-sdk'
 import { StoreType as RustSdkCryptoStoreType } from '@matrix-org/matrix-sdk-crypto-nodejs'
+import { marked } from 'marked'
+
+function toHtml(md: string): string {
+  return marked.parse(md) as string
+}
 
 // matrix-bot-sdk's default logger writes to stdout, which corrupts the stdio
 // MCP JSON-RPC channel. Redirect everything to stderr.
@@ -205,6 +211,100 @@ async function tmuxSend(keys: string): Promise<void> {
   await execAsync(`tmux -L ${TMUX_SOCKET} send-keys -t ${TMUX_SESSION} ${JSON.stringify(keys)} Enter`)
 }
 
+// --- !usage helpers ---
+
+interface UsageData {
+  five_hour?: { utilization?: number; resets_at?: string }
+  seven_day?: { utilization?: number; resets_at?: string }
+  extra_usage?: { is_enabled?: boolean; utilization?: number; used_credits?: number; monthly_limit?: number }
+}
+
+async function fetchUsageData(): Promise<UsageData | null> {
+  const cacheFile = '/tmp/claude/statusline-usage-cache.json'
+  const cacheMaxAge = 60 // seconds
+
+  // Try cache first
+  try {
+    const stat = statSync(cacheFile)
+    const ageSeconds = (Date.now() - stat.mtimeMs) / 1000
+    if (ageSeconds < cacheMaxAge) {
+      return JSON.parse(readFileSync(cacheFile, 'utf8')) as UsageData
+    }
+  } catch {}
+
+  // Fetch fresh from Anthropic
+  const credsPath = join(homedir(), '.claude', '.credentials.json')
+  let token: string | undefined
+  try {
+    const creds = JSON.parse(readFileSync(credsPath, 'utf8'))
+    token = creds?.claudeAiOauth?.accessToken
+  } catch {}
+  if (!token) return null
+
+  try {
+    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'claude-code/2.1.34',
+      },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) return null
+    const data = await res.json() as UsageData
+    // Update cache
+    try {
+      mkdirSync('/tmp/claude', { recursive: true })
+      writeFileSync(cacheFile, JSON.stringify(data))
+    } catch {}
+    return data
+  } catch {
+    return null
+  }
+}
+
+function formatResetTime(iso: string | undefined, style: 'time' | 'datetime' | 'date'): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return ''
+  const opts: Intl.DateTimeFormatOptions = { timeZone: 'Australia/Sydney' }
+  if (style === 'time') {
+    return d.toLocaleTimeString('en-AU', { ...opts, hour: 'numeric', minute: '2-digit', hour12: true })
+  } else if (style === 'datetime') {
+    return d.toLocaleString('en-AU', { ...opts, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })
+  } else {
+    return d.toLocaleDateString('en-AU', { ...opts, month: 'short', day: 'numeric' })
+  }
+}
+
+function formatUsageReply(data: UsageData): string {
+  const lines: string[] = ['**📊 Claude Usage**', '']
+
+  const fivePct = Math.round((data.five_hour?.utilization ?? 0))
+  const fiveReset = formatResetTime(data.five_hour?.resets_at, 'time')
+  lines.push(`Current (5h):  ${fivePct}%${fiveReset ? ` — resets ${fiveReset}` : ''}`)
+
+  const sevenPct = Math.round((data.seven_day?.utilization ?? 0))
+  const sevenReset = formatResetTime(data.seven_day?.resets_at, 'datetime')
+  lines.push(`Weekly (7d):   ${sevenPct}%${sevenReset ? ` — resets ${sevenReset}` : ''}`)
+
+  const extra = data.extra_usage
+  if (extra?.is_enabled) {
+    const used = ((extra.used_credits ?? 0) / 100).toFixed(2)
+    const limit = Math.round((extra.monthly_limit ?? 0) / 100)
+    const extraPct = Math.round(extra.utilization ?? 0)
+    // Reset = 1st of next month in AEST
+    const now = new Date()
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1)
+    const resetStr = nextMonth.toLocaleDateString('en-AU', { timeZone: 'Australia/Sydney', month: 'short', day: 'numeric' })
+    lines.push(`Extra:         $${used} / $${limit} (${extraPct}%) — resets ${resetStr}`)
+  }
+
+  return lines.join('\n')
+}
+
 async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
   switch (cmd) {
     case 'help': {
@@ -220,6 +320,7 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
         '`!model <name>` — switch model',
         '  aliases: `opus`, `sonnet`, `haiku` (or full model ID)',
         '`!restart` — restart the bridge service',
+        '`!usage` — Anthropic plan usage (5h, 7d, extra)',
       ]
       await sendText(ROOM_ID!, lines.join('\n'))
       return true
@@ -309,6 +410,20 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
       return true
     }
 
+    case 'usage': {
+      try {
+        const usageData = await fetchUsageData()
+        if (!usageData) {
+          await sendText(ROOM_ID!, 'Could not fetch usage data — credentials missing or API unreachable.')
+          return true
+        }
+        await sendText(ROOM_ID!, formatUsageReply(usageData))
+      } catch (err) {
+        await sendText(ROOM_ID!, `usage failed: ${err}`)
+      }
+      return true
+    }
+
     default:
       return false
   }
@@ -374,7 +489,12 @@ function trackBotEvent(id: string): void {
 }
 
 async function sendText(roomId: string, body: string): Promise<string> {
-  const id = await client.sendText(roomId, body)
+  const id = await client.sendMessage(roomId, {
+    msgtype: 'm.text',
+    body,
+    format: 'org.matrix.custom.html',
+    formatted_body: toHtml(body),
+  })
   trackBotEvent(id)
   return id
 }
@@ -383,6 +503,8 @@ async function sendReply(roomId: string, body: string, replyTo: string): Promise
   const id = await client.sendMessage(roomId, {
     msgtype: 'm.text',
     body,
+    format: 'org.matrix.custom.html',
+    formatted_body: toHtml(body),
     'm.relates_to': { 'm.in_reply_to': { event_id: replyTo } },
   })
   trackBotEvent(id)
@@ -396,10 +518,18 @@ async function sendReaction(roomId: string, eventId: string, emoji: string): Pro
 }
 
 async function editMessage(roomId: string, eventId: string, newBody: string): Promise<void> {
+  const html = toHtml(newBody)
   await client.sendMessage(roomId, {
     msgtype: 'm.text',
     body: `* ${newBody}`,
-    'm.new_content': { msgtype: 'm.text', body: newBody },
+    format: 'org.matrix.custom.html',
+    formatted_body: toHtml(`* ${newBody}`),
+    'm.new_content': {
+      msgtype: 'm.text',
+      body: newBody,
+      format: 'org.matrix.custom.html',
+      formatted_body: html,
+    },
     'm.relates_to': { rel_type: 'm.replace', event_id: eventId },
   })
 }
@@ -790,6 +920,41 @@ await mcp.connect(new StdioServerTransport())
 
 await client.start()
 process.stderr.write(`matrix channel: connected as ${BOT_USER_ID}, watching ${ROOM_ID}\n`)
+
+// Local HTTP endpoint so automated tools (e.g. morning-briefing.sh) can post
+// to the Matrix room via the already-authenticated E2EE client, without needing
+// Claude or a tmux session to be active.
+// POST /send  body: {"text": "..."}
+const httpServer = createHttpServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/send') {
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', () => {
+      void (async () => {
+        try {
+          const { text } = JSON.parse(body) as { text: string }
+          if (typeof text !== 'string' || !text) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end('{"error":"text required"}')
+            return
+          }
+          await sendText(ROOM_ID!, text)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end('{"ok":true}')
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })()
+    })
+  } else {
+    res.writeHead(404)
+    res.end('not found')
+  }
+})
+httpServer.listen(18765, '127.0.0.1', () => {
+  process.stderr.write('matrix channel: local HTTP send endpoint on 127.0.0.1:18765\n')
+})
 
 if (E2EE && RECOVERY_KEY) {
   try {
