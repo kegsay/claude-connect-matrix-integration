@@ -9,6 +9,12 @@
  * Required env: MATRIX_HOMESERVER_URL, MATRIX_ROOM_ID, MATRIX_USER_ID
  * One of: MATRIX_ACCESS_TOKEN, or (MATRIX_PASSWORD + username derived from MATRIX_USER_ID)
  * Optional: MATRIX_RECOVERY_KEY (SSSS key for autoSignDevice)
+ *
+ * Transport:
+ *   MATRIX_TRANSPORT=stdio  (default) — MCP over process stdin/stdout
+ *   MATRIX_TRANSPORT=tcp              — MCP over an authenticated TCP socket
+ *     Requires: MATRIX_SIDECAR_PORT, MATRIX_SIDECAR_TOKEN
+ *     Optional: MATRIX_SIDECAR_BIND (default 0.0.0.0)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -27,6 +33,8 @@ import { promisify } from 'util'
 import { homedir } from 'os'
 import { join, sep, basename, dirname } from 'path'
 import { fileURLToPath } from 'url'
+import { createServer as createTcpServer, type Socket } from 'net'
+import { timingSafeEqual } from 'crypto'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const CONTEXT_SCRIPT = join(__dirname, 'scripts', 'check-context.sh')
@@ -47,8 +55,9 @@ function toHtml(md: string): string {
   return marked.parse(md) as string
 }
 
-// matrix-bot-sdk's default logger writes to stdout, which corrupts the stdio
-// MCP JSON-RPC channel. Redirect everything to stderr.
+// matrix-bot-sdk's default logger writes to stdout, which corrupts a stdio
+// MCP JSON-RPC channel. Redirect everything to stderr regardless of transport
+// mode — stderr is also where we want logs in tcp mode.
 const fmt = (m: string, a: unknown[]) =>
   `[mbs] ${m}${a.length ? ' ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') : ''}\n`
 LogService.setLogger({
@@ -94,6 +103,26 @@ const PASSWORD = process.env.MATRIX_PASSWORD
 const RECOVERY_KEY = process.env.MATRIX_RECOVERY_KEY
 const E2EE = (process.env.MATRIX_E2EE ?? 'true') !== 'false'
 let ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN
+
+// --- Transport mode ---
+const TRANSPORT = (process.env.MATRIX_TRANSPORT ?? 'stdio').toLowerCase()
+if (TRANSPORT !== 'stdio' && TRANSPORT !== 'tcp') {
+  process.stderr.write(`matrix channel: invalid MATRIX_TRANSPORT=${TRANSPORT} (expected stdio|tcp)\n`)
+  process.exit(1)
+}
+const TCP_PORT = Number(process.env.MATRIX_SIDECAR_PORT ?? '0')
+const TCP_BIND = process.env.MATRIX_SIDECAR_BIND ?? '0.0.0.0'
+const TCP_TOKEN = process.env.MATRIX_SIDECAR_TOKEN ?? ''
+if (TRANSPORT === 'tcp') {
+  if (!TCP_PORT || TCP_PORT < 1 || TCP_PORT > 65535) {
+    process.stderr.write(`matrix channel: MATRIX_TRANSPORT=tcp requires MATRIX_SIDECAR_PORT (1..65535)\n`)
+    process.exit(1)
+  }
+  if (!TCP_TOKEN) {
+    process.stderr.write(`matrix channel: MATRIX_TRANSPORT=tcp requires MATRIX_SIDECAR_TOKEN\n`)
+    process.exit(1)
+  }
+}
 
 if (!HOMESERVER || !ROOM_ID || !BOT_USER_ID || (!ACCESS_TOKEN && !PASSWORD)) {
   process.stderr.write(
@@ -191,6 +220,14 @@ function chunkText(text: string, limit = 16000): string[] {
 }
 
 // --- !commands ---
+//
+// NOTE: many of these commands (tmux send-keys, systemctl --user, reading
+// ~/.claude/.credentials.json) target the *Claude process's* environment.
+// In tcp/sidecar mode the sidecar container has no tmux session, no user
+// systemd bus, and no Claude credentials, so these will return their normal
+// error path. That's graceful — they fail loudly via sendText rather than
+// silently misbehaving. If you want to disable them in sidecar mode, gate the
+// switch statement on TRANSPORT === 'stdio'.
 
 // Derive tmux session name from working directory basename (matches service ExecStart).
 const TMUX_SOCKET = 'claude-matrix'
@@ -921,12 +958,124 @@ function shutdown(): void {
   client.stop()
   setTimeout(() => process.exit(0), 1000)
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+
+if (TRANSPORT === 'stdio') {
+  // Stdio mode: bound to Claude Code's lifetime. Treat stdin closing as
+  // shutdown so the process exits cleanly when Claude exits.
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
+}
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-await mcp.connect(new StdioServerTransport())
+// --- Transport setup ---
+
+if (TRANSPORT === 'stdio') {
+  await mcp.connect(new StdioServerTransport())
+} else {
+  // TCP mode: accept one authenticated client at a time. On disconnect, the
+  // slot is released and a new client can connect (typical case: Claude
+  // process restart). The MCP server's internal state (pending permissions,
+  // tracked events) persists across reconnects, which is what we want — a
+  // permission request issued before reconnect can still be answered after.
+  //
+  // The transport instance, however, has to be replaced per connection.
+  let activeSocket: Socket | null = null
+
+  const tokenBuf = Buffer.from(TCP_TOKEN, 'utf8')
+
+  function authMatches(presented: string): boolean {
+    const presentedBuf = Buffer.from(presented, 'utf8')
+    // Length mismatch fails before timingSafeEqual (which requires equal length).
+    if (presentedBuf.length !== tokenBuf.length) return false
+    return timingSafeEqual(presentedBuf, tokenBuf)
+  }
+
+  const tcpServer = createTcpServer(socket => {
+    const remote = `${socket.remoteAddress}:${socket.remotePort}`
+
+    if (activeSocket) {
+      process.stderr.write(`matrix channel: rejecting concurrent client from ${remote}\n`)
+      socket.destroy()
+      return
+    }
+
+    socket.setKeepAlive(true, 30_000)
+    socket.setNoDelay(true)
+
+    // Auth phase: read up to first newline, compare token, then hand the
+    // remainder to MCP. Bounded by AUTH_MAX_BYTES to prevent junk floods.
+    const AUTH_MAX_BYTES = 1024
+    let authBuf = Buffer.alloc(0)
+    let authed = false
+    let authTimer: NodeJS.Timeout | null = setTimeout(() => {
+      if (!authed) {
+        process.stderr.write(`matrix channel: auth timeout from ${remote}\n`)
+        socket.destroy()
+      }
+    }, 5_000)
+
+    const onAuthData = (chunk: Buffer) => {
+      authBuf = Buffer.concat([authBuf, chunk])
+      const nl = authBuf.indexOf(0x0a)
+      if (nl < 0) {
+        if (authBuf.length > AUTH_MAX_BYTES) {
+          process.stderr.write(`matrix channel: auth preamble too large from ${remote}\n`)
+          socket.destroy()
+        }
+        return
+      }
+
+      const presented = authBuf.slice(0, nl).toString('utf8').replace(/\r$/, '')
+      const remainder = authBuf.slice(nl + 1)
+
+      if (!authMatches(presented)) {
+        process.stderr.write(`matrix channel: bad token from ${remote}\n`)
+        socket.destroy()
+        return
+      }
+
+      authed = true
+      activeSocket = socket
+      if (authTimer) { clearTimeout(authTimer); authTimer = null }
+      socket.off('data', onAuthData)
+      process.stderr.write(`matrix channel: client authenticated from ${remote}\n`)
+
+      // Replay anything that arrived in the same chunk after the auth line.
+      // unshift() pushes bytes back onto the readable side so the new consumer
+      // (MCP transport) sees them as if they hadn't been read yet.
+      if (remainder.length) socket.unshift(remainder)
+
+      // StdioServerTransport accepts (stdin, stdout). A Socket is both.
+      const transport = new StdioServerTransport(socket, socket)
+      mcp.connect(transport).catch(err => {
+        process.stderr.write(`matrix channel: mcp.connect failed: ${err}\n`)
+        socket.destroy()
+      })
+    }
+
+    socket.on('data', onAuthData)
+    socket.on('error', err => {
+      process.stderr.write(`matrix channel: socket error from ${remote}: ${err}\n`)
+    })
+    socket.on('close', () => {
+      if (authTimer) { clearTimeout(authTimer); authTimer = null }
+      if (activeSocket === socket) {
+        activeSocket = null
+        process.stderr.write(`matrix channel: client ${remote} disconnected\n`)
+      }
+    })
+  })
+
+  tcpServer.on('error', err => {
+    process.stderr.write(`matrix channel: tcp server error: ${err}\n`)
+    process.exit(1)
+  })
+
+  tcpServer.listen(TCP_PORT, TCP_BIND, () => {
+    process.stderr.write(`matrix channel: MCP transport listening on ${TCP_BIND}:${TCP_PORT}\n`)
+  })
+}
 
 await client.start()
 process.stderr.write(`matrix channel: connected as ${BOT_USER_ID}, watching ${ROOM_ID}\n`)
@@ -934,7 +1083,15 @@ process.stderr.write(`matrix channel: connected as ${BOT_USER_ID}, watching ${RO
 // Local HTTP endpoint so automated tools (e.g. morning-briefing.sh) can post
 // to the Matrix room via the already-authenticated E2EE client, without needing
 // Claude or a tmux session to be active.
+//
+// In stdio mode this binds to 127.0.0.1 (host-local). In tcp/sidecar mode the
+// listener binds to 0.0.0.0 so other containers on the internal Docker network
+// can reach it as <sidecar-host>:18765. If the briefing script runs on the
+// host in your setup, either move it onto the internal network or publish
+// 18765 to the host via docker-compose ports.
+//
 // POST /send  body: {"text": "..."}
+const HTTP_BIND = TRANSPORT === 'tcp' ? '0.0.0.0' : '127.0.0.1'
 const httpServer = createHttpServer((req, res) => {
   if (req.method === 'POST' && req.url === '/send') {
     let body = ''
@@ -962,8 +1119,8 @@ const httpServer = createHttpServer((req, res) => {
     res.end('not found')
   }
 })
-httpServer.listen(18765, '127.0.0.1', () => {
-  process.stderr.write('matrix channel: local HTTP send endpoint on 127.0.0.1:18765\n')
+httpServer.listen(18765, HTTP_BIND, () => {
+  process.stderr.write(`matrix channel: local HTTP send endpoint on ${HTTP_BIND}:18765\n`)
 })
 
 if (E2EE && RECOVERY_KEY) {
