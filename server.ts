@@ -744,7 +744,16 @@ interface InboundEvent {
     body?: string
     'm.relates_to'?: unknown
     'm.new_content'?: unknown
+    'm.mentions'?: { user_ids?: string[]; room?: boolean }
   }
+}
+
+function isBotMentioned(event: InboundEvent): boolean {
+  // Preferred: m.mentions intentional mention (MSC3952, modern clients)
+  const mentions = event.content?.['m.mentions']
+  if (mentions?.user_ids?.includes(BOT_USER_ID!)) return true
+
+  return false
 }
 
 async function handleMessage(roomId: string, event: InboundEvent): Promise<void> {
@@ -772,7 +781,9 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
     return
   }
 
-  // !command intercept — handled in the plugin, never forwarded to Claude
+  // !command intercept — handled in the plugin, never forwarded to Claude.
+  // Bang commands work without an @-mention by design — they're operator
+  // controls, not conversation.
   const bangMatch = /^!(\w+)(?:\s+([\s\S]*))?$/.exec(body.trim())
   if (bangMatch) {
     const handled = await handleBangCommand(bangMatch[1]!.toLowerCase(), (bangMatch[2] ?? '').trim())
@@ -780,6 +791,8 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
     return
   }
 
+  // Permission replies — also exempt from the mention requirement, so users
+  // can answer "yes abcde" / "no abcde" without re-addressing the bot.
   const permMatch = PERMISSION_REPLY_RE.exec(body)
   if (permMatch) {
     const request_id = permMatch[2]!.toLowerCase()
@@ -821,6 +834,14 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
       if (rid === request_id) { permissionEventIds.delete(eid); break }
     }
     void sendReaction(ROOM_ID!, eventId, behavior === 'allow' ? '✅' : '❌')
+    return
+  }
+
+  // Only forward to Claude if the bot was @mentioned. Silent drop otherwise —
+  // no reaction, no log spam. Reaction-based selections (handleReaction)
+  // bypass this entirely, so number-emoji answers to multiple-choice prompts
+  // still work without a mention.
+  if (!isBotMentioned(event)) {
     return
   }
 
