@@ -1082,8 +1082,10 @@ if (TRANSPORT === 'stdio') {
     socket.on('close', () => {
       if (authTimer) { clearTimeout(authTimer); authTimer = null }
       if (activeSocket === socket) {
-        activeSocket = null
         process.stderr.write(`matrix channel: client ${remote} disconnected\n`)
+        mcp.close()
+          .catch(err => process.stderr.write(`matrix channel: mcp.close failed: ${err}\n`))
+          .finally(() => { activeSocket = null })
       }
     })
   })
