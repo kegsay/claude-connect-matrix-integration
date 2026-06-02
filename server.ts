@@ -203,6 +203,25 @@ const pendingPermissions = new Map<string, { tool_name: string; description: str
 // 👍/👎 reactions on that message can be resolved without a text reply.
 const permissionEventIds = new Map<string, string>()
 
+// --- Mention targeting (hidden m.mentions ping, no visible pill) ---
+//
+// Maps inbound (user) event_id → sender, so a threaded reply (reply_to) can
+// @mention whoever actually asked. With multiple callers in the room, this is
+// load-bearing: it's how the *right* person gets the red highlight badge,
+// rather than whoever happened to speak most recently. Bounded.
+//
+// We deliberately set only m.mentions.user_ids (MSC3952 "intentional mention")
+// and leave the visible body untouched — that produces a "hidden" mention: the
+// recipient gets a highlight notification with no visible @pill clutter.
+const eventSenders = new Map<string, string>()
+function rememberSender(eventId: string, sender: string): void {
+  eventSenders.set(eventId, sender)
+  if (eventSenders.size > 200) {
+    const first = eventSenders.keys().next().value
+    if (first) eventSenders.delete(first)
+  }
+}
+
 function chunkText(text: string, limit = 16000): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -535,25 +554,33 @@ function trackBotEvent(id: string): void {
   }
 }
 
-async function sendText(roomId: string, body: string): Promise<string> {
-  const id = await client.sendMessage(roomId, {
+// Outgoing messages can carry an MSC3952 "intentional mention" by listing
+// Matrix IDs in mentionUsers. Only m.mentions.user_ids is set — the visible
+// body is left untouched, so the recipient gets a red highlight badge with no
+// @pill in the text. Default [] means no ping (bang-command echoes, etc.).
+async function sendText(roomId: string, body: string, mentionUsers: string[] = []): Promise<string> {
+  const content: Record<string, unknown> = {
     msgtype: 'm.text',
     body,
     format: 'org.matrix.custom.html',
     formatted_body: toHtml(body),
-  })
+  }
+  if (mentionUsers.length) content['m.mentions'] = { user_ids: mentionUsers }
+  const id = await client.sendMessage(roomId, content)
   trackBotEvent(id)
   return id
 }
 
-async function sendReply(roomId: string, body: string, replyTo: string): Promise<string> {
-  const id = await client.sendMessage(roomId, {
+async function sendReply(roomId: string, body: string, replyTo: string, mentionUsers: string[] = []): Promise<string> {
+  const content: Record<string, unknown> = {
     msgtype: 'm.text',
     body,
     format: 'org.matrix.custom.html',
     formatted_body: toHtml(body),
     'm.relates_to': { 'm.in_reply_to': { event_id: replyTo } },
-  })
+  }
+  if (mentionUsers.length) content['m.mentions'] = { user_ids: mentionUsers }
+  const id = await client.sendMessage(roomId, content)
   trackBotEvent(id)
   return id
 }
@@ -590,7 +617,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Matrix, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Matrix arrive as <channel source="matrix" room_id="..." event_id="..." user="..." ts="...">. Reply with the reply tool — pass room_id back. Use reply_to (event_id) to thread a specific message, omit it for normal responses.',
+      'Messages from Matrix arrive as <channel source="matrix" room_id="..." event_id="..." user="..." ts="...">. Reply with the reply tool — pass room_id back. Always pass reply_to (the inbound event_id) when responding to a specific person\'s message: the room may have multiple people talking to you at once, and reply_to is how the right person gets notified (it pings whoever sent that message). Omit it only for messages that answer no one in particular.',
       '',
       'Use react to add emoji reactions. Use edit_message for interim progress updates (edits do not push notifications — send a new reply when a long task completes so the user\'s device pings).',
       '',
@@ -614,7 +641,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Send a message to the Matrix room. Pass room_id from the inbound message. Optionally pass reply_to (event_id) to thread under a specific message.',
+      description: 'Send a message to the Matrix room. Pass room_id from the inbound message. Optionally pass reply_to (event_id) to thread under a specific message — this also @mentions (red-badge notifies) whoever sent that message.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -622,7 +649,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           reply_to: {
             type: 'string',
-            description: 'Event ID to thread under. Use event_id from the inbound <channel> block.',
+            description: 'Event ID to thread under. Use event_id from the inbound <channel> block. Also notifies the original sender.',
           },
         },
         required: ['room_id', 'text'],
@@ -666,12 +693,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         assertAllowedRoom(room_id)
+        // Resolve the original asker from reply_to so they get the red badge.
+        // With multiple callers, a wrong ping is worse than no ping — so if we
+        // can't resolve the sender (no reply_to, or it's aged out of the map),
+        // nobody is mentioned. Only the first chunk pings, so a long chunked
+        // reply doesn't buzz repeatedly.
+        const asker = reply_to ? eventSenders.get(reply_to) : undefined
         const chunks = chunkText(text)
         const sentIds: string[] = []
         for (let i = 0; i < chunks.length; i++) {
+          const mention = i === 0 && asker ? [asker] : []
           const id = reply_to && i === 0
-            ? await sendReply(room_id, chunks[i], reply_to)
-            : await sendText(room_id, chunks[i])
+            ? await sendReply(room_id, chunks[i], reply_to, mention)
+            : await sendText(room_id, chunks[i], mention)
           sentIds.push(id)
         }
         const result = sentIds.length === 1
@@ -723,6 +757,10 @@ mcp.setNotificationHandler(
       ``,
       `React 👍 to allow or 👎 to deny. (Or reply **yes ${request_id}** / **no ${request_id}**)`,
     ].filter(l => l !== undefined).join('\n')
+    // No asker to resolve here (permission requests don't originate from an
+    // inbound reply), so this is left un-pinged. If blocked-permission pings
+    // matter across callers, thread the triggering inbound sender through and
+    // pass [sender] as the third arg.
     const sentEventId = await sendText(ROOM_ID!, text).catch(err => {
       process.stderr.write(`matrix channel: permission_request send failed: ${err}\n`)
     })
@@ -844,6 +882,11 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
   if (!isBotMentioned(event)) {
     return
   }
+
+  // Record who asked, keyed by event_id, so Claude's threaded reply (reply_to)
+  // can mention the right person — this is what drives the red-badge ping in a
+  // multi-caller room.
+  rememberSender(eventId, event.sender ?? '')
 
   // Acknowledge receipt so the sender knows it landed before Claude replies
   void sendReaction(ROOM_ID!, eventId, '👀').catch(() => {})
@@ -1128,6 +1171,7 @@ const httpServer = createHttpServer((req, res) => {
             res.end('{"error":"text required"}')
             return
           }
+          // Briefings have no asker to resolve, so they go out un-pinged.
           await sendText(ROOM_ID!, text)
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end('{"ok":true}')
