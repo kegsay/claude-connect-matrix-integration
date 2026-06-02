@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "matrix": {
-      "command": "bun",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/server.ts"]
+      "command": "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server-shim.ts"]
     }
   }
 }

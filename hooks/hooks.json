@@ -1,0 +1,13 @@
+  {
+    "description": "Enforce that inbound Matrix messages are answered via mcp__matrix__reply, not only the CLI transcript.",
+    "hooks": {
+      "Stop": [
+        {
+          "matcher": "*",
+          "hooks": [
+            { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/matrix-reply-guard.sh" }
+          ]
+        }
+      ]
+    }
+  }
